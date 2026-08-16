@@ -1,54 +1,126 @@
-# API de génération du Bulletin d'inscription APNI (v2 — mapping intégré)
+# API de génération du Bulletin d'inscription APNI
 
-Cette version fait TOUT en un seul appel : elle prend les réponses Fillout
-brutes, fait le mapping vers les champs du PDF, gère les champs "comb"
-(cases individuelles), coche les cases à cocher, sélectionne les radios,
-et incruste les deux signatures téléchargées automatiquement.
+Reçoit les réponses brutes d'un formulaire Fillout, remplit le PDF officiel du
+bulletin, et renvoie de quoi le déposer dans une pièce jointe Airtable.
 
-## Déploiement (Render.com, gratuit pour commencer)
+Appelé par le scénario Make **6643033** — `Generate APNI French Course
+Subscription File`.
 
-1. Créer un compte sur https://render.com
-2. Pousser ce dossier sur un repo Git (GitHub/GitLab)
-3. Render : "New +" → "Web Service" → connecter le repo (Docker auto-détecté)
-4. Récupérer l'URL fournie, ex. https://apni-bulletin.onrender.com
+## ⚠️ Ce dépôt est public temporairement
 
-## Utilisation
+Le plan Vercel Hobby refuse de relier un dépôt **privé d'organisation** : pas de
+déploiement automatique sur push. Le dépôt a donc été publié pour avancer, et
+sera **repassé en privé au passage en plan Pro**, prévu.
 
-POST /generate-bulletin
+En conséquence : **aucun secret, aucun identifiant interne, aucune donnée
+personnelle réelle** dans ce dépôt. Le service ne détient aucune clé — ni
+Airtable, ni rien d'autre — et c'est ce qui rend la publication tenable. Les
+jeux de test utilisent des valeurs fictives de même forme que les vraies.
+
+## Contrat
+
+### `POST /generate-bulletin`
+
 ```json
-{ "fillout_answers": { "5av5": "...", "6qjk": "Camille", ... } }
+{ "fillout_answers": { "5av5": "…", "6qjk": "Sofia", … } }
 ```
-= exactement le contenu de `2.answers` dans Make, envoyé tel quel.
 
-Réponse : le PDF rempli, en binaire (Content-Type: application/pdf).
+Soit exactement le contenu de `{{2.answers}}` dans Make, envoyé tel quel : le
+service fait lui-même toute la correspondance vers les champs du PDF.
 
-## Dans Make (scénario simplifié — 2 modules seulement)
+Réponse par défaut (`?format=airtable`) :
 
-1. **Fillout** (trigger, déjà en place)
-2. **HTTP → Make a request**
-   - URL : `https://votre-app.onrender.com/generate-bulletin`
-   - Method : POST
-   - Body type : raw / JSON
-   - Body : `{ "fillout_answers": {{2.answers}} }`
-   - Parse response : binaire (laisser tel quel)
-3. Le corps de la réponse (PDF binaire) se branche directement dans
-   Airtable "Upload Attachment", Google Drive "Upload a File", ou Gmail.
+```json
+{
+  "attachment": [
+    {"url": "https://…/bulletin.pdf?d=…&nom=…",
+     "filename": "bulletin_apni_MARTINEZ_Sofia.pdf"}
+  ],
+  "filename": "bulletin_apni_MARTINEZ_Sofia.pdf",
+  "signatures_manquantes": []
+}
+```
 
-Plus besoin du module Google Drive de téléchargement ni du module Code —
-le template est embarqué dans l'image Docker.
+`?format=pdf` renvoie le PDF binaire.
+
+| Code | Quand |
+|---|---|
+| `400` | corps JSON illisible, ou `fillout_answers` absent |
+| `422` | réponses trop volumineuses pour tenir dans l'URL (plafond 8 000 caractères) |
+| `500` | rendu impossible |
+
+En-tête `X-APNI-Signatures-Manquantes` sur toutes les réponses réussies. Une
+signature injoignable **n'interrompt pas** la génération : le bulletin sort sans
+elle, mais l'absence est signalée là et dans les logs.
+
+### `GET /bulletin.pdf?d=<charge>&nom=<fichier>`
+
+Régénère le bulletin depuis la charge encodée. **C'est cette URL qu'Airtable
+télécharge.**
+
+## Pourquoi une URL et pas les octets du PDF
+
+Airtable va chercher ses pièces jointes à une URL : on ne peut pas lui pousser
+du binaire. Le module attend `[{url, filename}]`.
+
+C'est ce qui a fait échouer le scénario en `413` le 2026-07-22 — sans que
+personne ne s'en aperçoive pendant trois semaines, le champ
+`application_apni_subscription_file_attachment` étant resté vide sur la totalité
+des fiches.
+
+Plutôt qu'héberger le PDF quelque part — ce qui imposerait un stockage et un
+secret à un service qui n'en a aucun — le POST renvoie une **URL vers ce même
+service**, portant le résultat du mapping compressé (`zlib` + `base64url`). Le
+rendu étant déterministe, le GET reproduit le fichier à l'octet près. Aucun
+état, aucune expiration, aucun ménage.
+
+Ce qui est encodé n'est pas les réponses Fillout brutes mais le **résultat du
+mapping** : c'est plus court, et le GET devient un pur rendu. Mesuré sur un
+formulaire complet : **1 339 caractères** d'URL, sur un plafond de 8 000.
+
+Même motif que le service frère `ecf-livret-api`, en production depuis le
+2026-08-11.
+
+## Trois pièges du template, traités
+
+**Le PDF a un AcroForm.** Contrairement au livret ECF, il n'y a aucune
+coordonnée à mesurer : chaque champ porte son rectangle, le code écrit dedans.
+Seuls les champs « comb » (découpés en cases : n° de sécurité sociale, dates)
+sont peints à la main, la largeur de case étant déduite du rectangle.
+
+**Cinq champs sont définis sur un parent** — « Organisme de formation », « Code
+du module », « Lieu de formation » et les deux « Civilité ». Leur widget n'a pas
+de `/T`, donc `update_page_form_field_values` ne les trouvait pas et ne les
+remplissait pas : **ces cinq champs sont restés vides sur tous les bulletins
+jusqu'au 2026-08-16**. On écrit désormais `/V` sur le champ porteur, et `/AS`
+sur le bon widget pour les boutons — `/V` seul laisse la case visuellement vide
+alors que le formulaire la dit cochée.
+
+**Le calque ne doit pas être fusionné dans la page.** `page.merge_page()`
+recombine les flux de contenu, donc décompresse celui de la page et le réécrit
+tel quel : les pages 3 et 4 pèsent 2,1 Mo décompressées chacune, et le bulletin
+sortait à **5,4 Mo au lieu de 2,0** — au-dessus de la limite de réponse de
+4,5 Mo d'une fonction Vercel. Le calque est donc posé en Form XObject appelé
+depuis `/Contents`, sans toucher au flux d'origine.
+
+## Déploiement
+
+**Vercel**, équipe `each-one`, déploiement automatique sur push vers `main`.
+Vercel détecte `main.py` exposant `app` et installe `requirements.txt` : rien à
+configurer. Le `Dockerfile` est conservé pour Render ou Dokploy, et exclu du
+paquet Vercel par `.vercelignore`.
+
+## Développement
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
 
 ## Mettre à jour le template
 
-Si le PDF APNI change de mise en page, remplacer `template.pdf` dans ce
-dossier et redéployer (Render redéploie automatiquement au push Git).
-
-## Limites connues
-
-- Les champs signature ne sont pas de vraies signatures électroniques :
-  l'image envoyée par Fillout est simplement incrustée visuellement dans
-  l'encadré prévu.
-- Le mapping (fichier `mapping_and_fill.py`) est basé sur les clés de
-  question Fillout actuelles (5av5, 6qjk, etc.). Si le formulaire Fillout
-  est modifié (nouvelle question, question supprimée), il faut ajuster
-  les dictionnaires `SIMPLE_FIELD_MAP`, `DATE_FIELD_MAP`, etc. en haut du
-  fichier.
+Remplacer `template.pdf` et relancer les tests : ceux de `tests/test_rendu.py`
+vérifient que les champs attendus existent toujours et que le poids reste sous
+la limite Vercel. Si le formulaire Fillout change (question ajoutée ou
+supprimée), ajuster les dictionnaires en haut de `mapping_and_fill.py` — les
+clés y sont celles de Fillout (`5av5`, `6qjk`…).

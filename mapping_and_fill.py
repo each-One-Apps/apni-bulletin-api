@@ -1,27 +1,35 @@
 """
-Module Make "Code" (Python) — génération du Bulletin d'inscription APNI
-à partir des réponses Fillout brutes.
+Traduction des réponses Fillout en valeurs de champs PDF, puis remplissage
+du Bulletin d'inscription APNI.
 
-Config du module Code dans Make :
-- language: Python
-- Advanced settings > Add dependencies : pypdf , reportlab , requests
-- Input à mapper :
-    - template_base64 : le PDF vierge en base64 (cf. note en bas de fichier)
-    - fillout_answers : mappe directement `2.answers` (le bundle "Answers"
-      sorti du module Fillout "Get Record From Fillout") — pas besoin de le
-      retraiter avant, ce script fait tout le mapping lui-même.
+Deux étages, volontairement séparés :
 
-Sortie :
-    - pdf_base64 : le PDF rempli, encodé en base64
+    build_field_values(answers) -> [{"field_id": …, "value": …}]
+    get_signature_urls(answers) -> {field_id: url_png}
+        connaissent les clés Fillout (5av5, 6qjk…) et rien du PDF.
+
+    fill_pdf(template, valeurs, signatures) -> (pdf, signatures_manquantes)
+        connaît le PDF et rien de Fillout.
+
+C'est cette frontière qui permet à l'API de n'encoder dans l'URL de la pièce
+jointe que le RÉSULTAT du mapping : le rendu se rejoue sans repasser par les
+clés Fillout, et l'URL reste courte.
 """
-import base64
 import io
+import logging
+import re
+import unicodedata
+import zlib
 
 import requests
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ArrayObject, FloatObject, NameObject, IndirectObject
+from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
+                           FloatObject, IndirectObject, NameObject, NumberObject,
+                           TextStringObject)
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
+
+logger = logging.getLogger("apni")
 
 COMB_BIT = 1 << 24  # bit 25 (1-indexed) = flag "Comb" d'un champ PDF
 
@@ -51,11 +59,21 @@ NIVEAU_MAP = [
 
 
 def niveau_choix(label):
+    """Le libellé Fillout porte un suffixe (« Niveau 4 (Baccalauréat) ») : on
+    compare par préfixe. Mais le préfixe ne doit pas être suivi d'un chiffre,
+    sinon « Niveau 42 » cocherait « Niveau 4 » — cocher un niveau d'étude par
+    accident sur un bulletin signé n'est pas rattrapable.
+
+    L'ordre de NIVEAU_MAP fait le reste : « Niveau 3 BIS » est testé avant
+    « Niveau 3 », dont il porte aussi le préfixe.
+    """
     if not label:
         return None
-    for prefix, choix in NIVEAU_MAP:
-        if label.startswith(prefix):
-            return choix
+    for prefixe, choix in NIVEAU_MAP:
+        if label.startswith(prefixe):
+            suite = label[len(prefixe):]
+            if not suite or not suite[0].isdigit():
+                return choix
     return None
 
 
@@ -192,6 +210,30 @@ def get_signature_urls(answers):
     return sigs
 
 
+def _ascii(texte):
+    """« Martínez-Dupont » -> « Martinez_Dupont ».
+
+    Le nom part dans un nom de fichier et dans une URL : on ne laisse passer
+    que de l'ASCII alphanumérique, le reste devient un souligné.
+    """
+    sans_accent = unicodedata.normalize("NFKD", str(texte))
+    sans_accent = sans_accent.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9]", "_", sans_accent)).strip("_")
+
+
+def nom_fichier(answers):
+    """« bulletin_apni_MARTINEZ_Sofia.pdf », d'après les réponses du salarié.
+
+    Le nom d'usage prime sur le nom de naissance : c'est celui sous lequel la
+    personne est connue. Si les deux manquent, on ne fabrique pas un nom à
+    partir de rien — repli sur un nom neutre.
+    """
+    nom = _ascii(answers.get("mDbu") or answers.get("rGdi") or "")
+    prenom = _ascii(answers.get("6qjk") or "")
+    morceaux = [m for m in ("bulletin_apni", nom, prenom) if m]
+    return "_".join(morceaux)[:150] + ".pdf"
+
+
 # ---------------------------------------------------------------------------
 # 2) Remplissage du PDF (détection auto des champs "comb")
 # ---------------------------------------------------------------------------
@@ -227,14 +269,130 @@ def get_widgets(writer):
             yield page_index, ann, name, ft, ff, maxlen, rect
 
 
+def rogner_marges(octets):
+    """Retire les marges transparentes d'une signature Fillout.
+
+    Les PNG de signature arrivent en 1124×300 pour un trait qui en occupe le
+    tiers : sans rognage, la signature est minuscule au milieu de son cadre.
+    Même correctif que sur `ecf-livret-api`, où le défaut a été mesuré.
+
+    Toute erreur ramène l'image d'origine : mal rognée vaut mieux qu'absente.
+    """
+    try:
+        from PIL import Image  # fourni avec reportlab
+    except ImportError:
+        return octets
+    try:
+        image = Image.open(io.BytesIO(octets)).convert("RGBA")
+        boite = image.getchannel("A").getbbox()
+        if boite is None:  # entièrement transparente : rien à rogner
+            return octets
+        sortie = io.BytesIO()
+        image.crop(boite).save(sortie, format="PNG")
+        return sortie.getvalue()
+    except Exception:
+        return octets
+
+
+def champ_porteur(ann):
+    """Le champ qui porte la valeur : le parent s'il existe, sinon le widget.
+
+    Sur ce template, cinq champs sont définis sur un parent dont le widget
+    n'est qu'un enfant sans `/T` : « Organisme de formation », « Code du
+    module », « Lieu de formation » et les deux « Civilité ».
+    `update_page_form_field_values` cherche par `/T` sur l'annotation, ne les
+    trouve pas, et ne les remplit pas — constaté le 2026-08-16 en relisant le
+    rendu, jamais vu avant parce que le scénario n'a jamais tourné.
+    """
+    parent = ann.get("/Parent")
+    return parent.get_object() if parent is not None else ann
+
+
+def ecrire_texte(ann, valeur):
+    champ_porteur(ann)[NameObject("/V")] = TextStringObject(valeur)
+
+
+def cocher(ann, etat):
+    """Coche un bouton : `/V` sur le champ, `/AS` sur le bon widget.
+
+    `/V` seul ne suffit pas — c'est `/AS` qui désigne l'apparence affichée.
+    Sans lui, la case reste visuellement vide alors que le formulaire la dit
+    cochée : le pire des deux mondes sur un document signé.
+    """
+    champ = champ_porteur(ann)
+    champ[NameObject("/V")] = NameObject(etat)
+    for widget in (champ.get("/Kids") or [ann]):
+        widget = widget.get_object()
+        apparences = (widget.get("/AP") or {}).get("/N") or {}
+        widget[NameObject("/AS")] = NameObject(etat if etat in apparences else "/Off")
+
+
+def _flux(writer, donnees):
+    flux = DecodedStreamObject()
+    flux.set_data(donnees)
+    return writer._add_object(flux)
+
+
+def poser_calque(writer, page, calque, nom="/APNIcalque"):
+    """Dépose un calque reportlab sur une page, sans toucher à son contenu.
+
+    `page.merge_page()` ferait la même chose en une ligne, mais il recombine
+    les deux flux de contenu — donc décompresse celui de la page et le
+    réécrit tel quel. Sur ce template, les pages 3 et 4 pèsent 2,1 Mo une fois
+    décompressées : le bulletin sortait à 5,4 Mo au lieu de 2,0 (mesuré le
+    2026-08-16), au-dessus de la limite de réponse de 4,5 Mo de Vercel.
+
+    Ici le calque devient un Form XObject — il porte ses propres ressources,
+    donc aucune collision de noms à arbitrer — appelé depuis un flux ajouté à
+    la fin de `/Contents`. Le flux d'origine reste compressé, intact.
+
+    Le `q`/`Q` autour de l'ancien contenu n'est pas décoratif : si la page
+    laisse la matrice de transformation modifiée, le calque se poserait de
+    travers.
+    """
+    boite = page.mediabox
+    largeur, hauteur = float(boite.width), float(boite.height)
+
+    xobjet = DecodedStreamObject()
+    xobjet.set_data(zlib.compress(calque.get_contents().get_data(), 9))
+    xobjet[NameObject("/Filter")] = NameObject("/FlateDecode")
+    xobjet[NameObject("/Type")] = NameObject("/XObject")
+    xobjet[NameObject("/Subtype")] = NameObject("/Form")
+    xobjet[NameObject("/FormType")] = NumberObject(1)
+    xobjet[NameObject("/BBox")] = ArrayObject(
+        [FloatObject(0), FloatObject(0), FloatObject(largeur), FloatObject(hauteur)])
+    xobjet[NameObject("/Resources")] = calque[NameObject("/Resources")].clone(writer)
+    reference = writer._add_object(xobjet)
+
+    ressources = page[NameObject("/Resources")].get_object()
+    if "/XObject" not in ressources:
+        ressources[NameObject("/XObject")] = DictionaryObject()
+    ressources[NameObject("/XObject")].get_object()[NameObject(nom)] = reference
+
+    ancien = page.raw_get("/Contents")
+    flux_anciens = list(ancien.get_object()) if isinstance(ancien.get_object(), ArrayObject) \
+        else [ancien]
+    page[NameObject("/Contents")] = ArrayObject(
+        [_flux(writer, b"q\n")]
+        + flux_anciens
+        + [_flux(writer, b"Q\n"), _flux(writer, b"q\n%s Do\nQ\n" % nom.encode("ascii"))]
+    )
+
+
 def fill_pdf(template_bytes, field_values, signature_urls):
+    """Renvoie (pdf_bytes, signatures_manquantes).
+
+    Une signature injoignable n'interrompt pas la génération — décidé le
+    2026-08-16 — mais elle est rendue à l'appelant, qui la signale. Elle ne
+    disparaît pas en silence.
+    """
+    signatures_manquantes = []
     values_by_id = {fv["field_id"]: fv["value"] for fv in field_values}
 
     reader = PdfReader(io.BytesIO(template_bytes))
     writer = PdfWriter(clone_from=reader)
 
     comb_widgets = []
-    normal_values_by_page = {}
     signature_rects = {}  # field_id -> (page_index, rect)
 
     for page_index, ann, name, ft, ff, maxlen, rect in get_widgets(writer):
@@ -245,14 +403,14 @@ def fill_pdf(template_bytes, field_values, signature_urls):
         value = values_by_id[name]
         is_comb = ft == "/Tx" and ff is not None and (int(ff) & COMB_BIT) and maxlen
         if is_comb:
+            # Champ découpé en cases : le lecteur ne sait pas les centrer,
+            # on dessine chaque caractère nous-mêmes.
             comb_widgets.append((page_index, rect, int(maxlen), str(value)))
+        elif ft == "/Btn":
+            cocher(ann, str(value))
         else:
-            normal_values_by_page.setdefault(page_index, {})[name] = value
+            ecrire_texte(ann, str(value))
 
-    for page_index, values in normal_values_by_page.items():
-        writer.update_page_form_field_values(
-            writer.pages[page_index], values, auto_regenerate=False
-        )
     writer.set_need_appearances_writer(True)
 
     overlays_by_page = {}
@@ -266,7 +424,9 @@ def fill_pdf(template_bytes, field_values, signature_urls):
             resp.raise_for_status()
             overlays_by_page.setdefault(page_index, []).append(("image", rect, resp.content, None))
         except Exception as e:
-            print(f"Signature '{field_id}' non récupérée ({e}), ignorée.")
+            logger.warning("signature « %s » injoignable (%s) — bulletin produit sans elle",
+                           field_id, e)
+            signatures_manquantes.append(field_id)
 
     for page_index, entries in overlays_by_page.items():
         page = writer.pages[page_index]
@@ -292,7 +452,7 @@ def fill_pdf(template_bytes, field_values, signature_urls):
                 _, rect, img_bytes, _ = entry
                 left, bottom, right, top = rect
                 box_w, box_h = right - left, top - bottom
-                img = ImageReader(io.BytesIO(img_bytes))
+                img = ImageReader(io.BytesIO(rogner_marges(img_bytes)))
                 iw, ih = img.getSize()
                 scale = min(box_w / iw, box_h / ih)
                 draw_w, draw_h = iw * scale, ih * scale
@@ -302,14 +462,8 @@ def fill_pdf(template_bytes, field_values, signature_urls):
 
         c.save()
         buf.seek(0)
-        overlay_reader = PdfReader(buf)
-        page.merge_page(overlay_reader.pages[0])
+        poser_calque(writer, page, PdfReader(buf).pages[0])
 
     out = io.BytesIO()
     writer.write(out)
-    return out.getvalue()
-
-
-# ---------------------------------------------------------------------------
-# 3) Point d'entrée du module Make
-# ---------------------------------------------------------------------------
+    return out.getvalue(), signatures_manquantes
